@@ -1,10 +1,3 @@
-//
-//  Dump.swift
-//  appdump
-//
-//  Created by paradiseduo on 2021/7/29.
-//
-
 import Foundation
 import MachO
 
@@ -14,6 +7,27 @@ func mremap_encrypted(_: UnsafeMutableRawPointer, _: Int, _: UInt32, _: UInt32, 
 class Dump {
     let consoleIO = ConsoleIO()
     var targetUrl = ""
+    
+    // Hàm thực thi lệnh shell và trả về output
+    func shell(_ command: String) -> (String, String, Int32) {
+        let task = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        task.standardOutput = stdoutPipe
+        task.standardError = stderrPipe
+        task.arguments = ["-c", command]
+        task.launchPath = "/bin/sh"
+        task.launch()
+        
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        
+        let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+        
+        task.waitUntilExit()
+        return (stdout, stderr, task.terminationStatus)
+    }
     
     func staticMode() {
         if CommandLine.argc < 3 {
@@ -136,7 +150,7 @@ class Dump {
         // 2. Bổ sung: Tìm Mach-O files qua thư mục _CodeSignature
         findMachOFilesViaCodeSignature(in: sourceUrl, needDumpFilePaths: &needDumpFilePaths, dumpedFilePaths: &dumpedFilePaths)
         
-        // 3. Kiểm tra danh sách trước khi dump
+        // 3. Xử lý dump tất cả các file đã tìm thấy
         if needDumpFilePaths.isEmpty {
             consoleIO.writeMessage("No Mach-O files found to dump.", to: .error)
             return
@@ -144,10 +158,16 @@ class Dump {
         
         consoleIO.writeMessage("Found \(needDumpFilePaths.count) Mach-O files to dump.")
         
-        // 4. Xử lý dump tất cả các file đã tìm thấy
+        // Giai đoạn 1: Dump bằng phương pháp gốc (Dump.dump)
+        var successfulDumps = 0
+        var failedDumpIndices: [Int] = [] // Lưu chỉ số của các file không dump được để gọi flexdecrypt2 sau
+        
         for (i, sourcePath) in needDumpFilePaths.enumerated() {
             let targetPath = dumpedFilePaths[i]
+            consoleIO.writeMessage("Decrypting \(sourcePath) to \(targetPath) using Dump.dump")
             let handle = dlopen(sourcePath, RTLD_LAZY | RTLD_GLOBAL)
+            
+            var dumpSuccess = false
             Dump.mapFile(path: sourcePath, mutable: false) { base_size, base_descriptor, base_error, base_raw in
                 if let base = base_raw {
                     Dump.mapFile(path: targetPath, mutable: true) { dupe_size, dupe_descriptor, dupe_error, dupe_raw in
@@ -159,12 +179,13 @@ class Dump {
                                 assert(header.pointee.cpusubtype == CPU_SUBTYPE_ARM64_ALL)
                                 
                                 guard var curCmd = UnsafeMutablePointer<load_command>(bitPattern: UInt(bitPattern: header)+UInt(MemoryLayout<mach_header_64>.size)) else {
-                                    consoleIO.writeMessage("Failed to access load commands for \(sourcePath)", to: .error)
+                                    munmap(base, base_size)
+                                    munmap(dupe, dupe_size)
+                                    consoleIO.writeMessage("Failed to parse load commands for \(sourcePath)", to: .error)
                                     return
                                 }
                                 
                                 var segCmd: UnsafeMutablePointer<load_command>!
-                                var foundEncryptionInfo = false
                                 for _: UInt32 in 0 ..< header.pointee.ncmds {
                                     segCmd = curCmd
                                     if segCmd.pointee.cmd == LC_ENCRYPTION_INFO_64 {
@@ -173,16 +194,14 @@ class Dump {
                                         if result.0 {
                                             command.pointee.cryptid = 0
                                             consoleIO.writeMessage("Dump \(sourcePath) Success")
+                                            successfulDumps += 1
+                                            dumpSuccess = true
                                         } else {
-                                            consoleIO.writeMessage("Dump \(sourcePath) fail, because of \(result.1)", to: .error)
+                                            consoleIO.writeMessage("Dump \(sourcePath) fail, because of \(result.1)")
                                         }
-                                        foundEncryptionInfo = true
                                         break
                                     }
                                     curCmd = UnsafeMutableRawPointer(curCmd).advanced(by: Int(curCmd.pointee.cmdsize)).assumingMemoryBound(to: load_command.self)
-                                }
-                                if !foundEncryptionInfo {
-                                    consoleIO.writeMessage("No LC_ENCRYPTION_INFO_64 found for \(sourcePath)", to: .error)
                                 }
                                 munmap(base, base_size)
                                 munmap(dupe, dupe_size)
@@ -204,38 +223,68 @@ class Dump {
                 }
             }
             dlclose(handle)
+            
+            // Nếu dump thất bại, lưu chỉ số để gọi flexdecrypt2 sau
+            if !dumpSuccess {
+                failedDumpIndices.append(i)
+            }
         }
+        
+        // Giai đoạn 2: Nếu số file dump thành công nhỏ hơn số file Mach-O, gọi flexdecrypt2
+        if successfulDumps < needDumpFilePaths.count {
+            consoleIO.writeMessage("Number of decrypted files (\(successfulDumps)) is less than number of Mach-O files (\(needDumpFilePaths.count)). Forcing flexdecrypt2 to ensure complete decryption.")
+            
+            for index in failedDumpIndices {
+                let sourcePath = needDumpFilePaths[index]
+                let targetPath = dumpedFilePaths[index]
+                consoleIO.writeMessage("Decrypting \(sourcePath) to \(targetPath) using flexdecrypt2")
+                
+                // Gọi flexdecrypt2 để giải mã file Mach-O
+                let (flexOutput, flexError, flexStatus) = shell("/usr/local/bin/flexdecrypt2 '\(targetPath)'")
+                if flexStatus == 0 {
+                    consoleIO.writeMessage("Dump \(sourcePath) Success with flexdecrypt2")
+                    successfulDumps += 1
+                } else {
+                    consoleIO.writeMessage("Dump \(sourcePath) failed with flexdecrypt2: \(flexOutput)", to: .error)
+                    consoleIO.writeMessage("Error: \(flexError)", to: .error)
+                }
+            }
+        }
+        
+        consoleIO.writeMessage("Decryption process completed: \(successfulDumps)/\(needDumpFilePaths.count) files decrypted successfully")
     }
     
     // MARK: - Phương pháp tìm kiếm qua _CodeSignature
     private func findMachOFilesViaCodeSignature(in directory: String, needDumpFilePaths: inout [String], dumpedFilePaths: inout [String]) {
         let fileManager = FileManager.default
         
-        if let enumerator = fileManager.enumerator(atPath: directory) {
-            while let item = enumerator.nextObject() as? String {
-                if item.hasSuffix("_CodeSignature") {
-                    let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
-                    
-                    do {
-                        let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
-                        for file in contents {
-                            let fullPath = (parentDir as NSString).appendingPathComponent(file)
-                            var isDir: ObjCBool = false
+        // Sử dụng enumerator với tùy chọn bỏ qua thư mục con không cần thiết
+        let enumerator = fileManager.enumerator(atPath: directory)
+        while let item = enumerator?.nextObject() as? String {
+            if item.hasSuffix("_CodeSignature") {
+                let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
+                
+                do {
+                    let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
+                    for file in contents {
+                        let fullPath = (parentDir as NSString).appendingPathComponent(file)
+                        var isDir: ObjCBool = false
+                        
+                        if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
+                           !isDir.boolValue,
+                           isMachOFile(fullPath),
+                           !needDumpFilePaths.contains(fullPath) {
                             
-                            if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
-                               !isDir.boolValue,
-                               isMachOFile(fullPath),
-                               !needDumpFilePaths.contains(fullPath) {
-                                let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
-                                let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
-                                needDumpFilePaths.append(fullPath)
-                                dumpedFilePaths.append(targetPath)
-                                consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
-                            }
+                            let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
+                            let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
+                            
+                            needDumpFilePaths.append(fullPath)
+                            dumpedFilePaths.append(targetPath)
+                            consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
                         }
-                    } catch {
-                        consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
                     }
+                } catch {
+                    consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
                 }
             }
         }
@@ -310,3 +359,32 @@ class Dump {
         handle(Int(s.st_size), f, "", base)
     }
 }
+
+// MARK: - ConsoleIO (giả định đã có sẵn trong dự án)
+class ConsoleIO {
+    enum OutputType {
+        case error
+        case standard
+    }
+    
+    func writeMessage(_ message: String, to: OutputType = .standard) {
+        switch to {
+        case .standard:
+            print(message)
+        case .error:
+            fputs("\(message)\n", stderr)
+        }
+    }
+    
+    func printUsage() {
+        let executableName = (CommandLine.arguments[0] as NSString).lastPathComponent
+        writeMessage("Usage: \(executableName) <source_path> <target_path> [--ignore-ios-check]")
+        writeMessage("  <source_path>: Path to the source application directory")
+        writeMessage("  <target_path>: Path to the target directory for decrypted files")
+        writeMessage("  --ignore-ios-check: Ignore iOS-only check on macOS")
+    }
+}
+
+// MARK: - Main
+let dump = Dump()
+dump.staticMode()
