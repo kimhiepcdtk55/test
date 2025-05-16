@@ -1,3 +1,10 @@
+//
+//  Dump.swift
+//  appdump
+//
+//  Created by paradiseduo on 2021/7/29.
+//
+
 import Foundation
 import MachO
 
@@ -129,13 +136,15 @@ class Dump {
         // 2. Bổ sung: Tìm Mach-O files qua thư mục _CodeSignature
         findMachOFilesViaCodeSignature(in: sourceUrl, needDumpFilePaths: &needDumpFilePaths, dumpedFilePaths: &dumpedFilePaths)
         
-        // 3. Xử lý dump tất cả các file đã tìm thấy
+        // 3. Kiểm tra danh sách trước khi dump
         if needDumpFilePaths.isEmpty {
             consoleIO.writeMessage("No Mach-O files found to dump.", to: .error)
             return
         }
         
         consoleIO.writeMessage("Found \(needDumpFilePaths.count) Mach-O files to dump.")
+        
+        // 4. Xử lý dump tất cả các file đã tìm thấy
         for (i, sourcePath) in needDumpFilePaths.enumerated() {
             let targetPath = dumpedFilePaths[i]
             let handle = dlopen(sourcePath, RTLD_LAZY | RTLD_GLOBAL)
@@ -150,10 +159,12 @@ class Dump {
                                 assert(header.pointee.cpusubtype == CPU_SUBTYPE_ARM64_ALL)
                                 
                                 guard var curCmd = UnsafeMutablePointer<load_command>(bitPattern: UInt(bitPattern: header)+UInt(MemoryLayout<mach_header_64>.size)) else {
+                                    consoleIO.writeMessage("Failed to access load commands for \(sourcePath)", to: .error)
                                     return
                                 }
                                 
                                 var segCmd: UnsafeMutablePointer<load_command>!
+                                var foundEncryptionInfo = false
                                 for _: UInt32 in 0 ..< header.pointee.ncmds {
                                     segCmd = curCmd
                                     if segCmd.pointee.cmd == LC_ENCRYPTION_INFO_64 {
@@ -163,11 +174,15 @@ class Dump {
                                             command.pointee.cryptid = 0
                                             consoleIO.writeMessage("Dump \(sourcePath) Success")
                                         } else {
-                                            consoleIO.writeMessage("Dump \(sourcePath) fail, because of \(result.1)")
+                                            consoleIO.writeMessage("Dump \(sourcePath) fail, because of \(result.1)", to: .error)
                                         }
+                                        foundEncryptionInfo = true
                                         break
                                     }
                                     curCmd = UnsafeMutableRawPointer(curCmd).advanced(by: Int(curCmd.pointee.cmdsize)).assumingMemoryBound(to: load_command.self)
+                                }
+                                if !foundEncryptionInfo {
+                                    consoleIO.writeMessage("No LC_ENCRYPTION_INFO_64 found for \(sourcePath)", to: .error)
                                 }
                                 munmap(base, base_size)
                                 munmap(dupe, dupe_size)
@@ -196,33 +211,31 @@ class Dump {
     private func findMachOFilesViaCodeSignature(in directory: String, needDumpFilePaths: inout [String], dumpedFilePaths: inout [String]) {
         let fileManager = FileManager.default
         
-        // Sử dụng enumerator với tùy chọn bỏ qua thư mục con không cần thiết
-        let enumerator = fileManager.enumerator(atPath: directory)
-        while let item = enumerator?.nextObject() as? String {
-            if item.hasSuffix("_CodeSignature") {
-                let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
-                
-                do {
-                    let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
-                    for file in contents {
-                        let fullPath = (parentDir as NSString).appendingPathComponent(file)
-                        var isDir: ObjCBool = false
-                        
-                        if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
-                           !isDir.boolValue,
-                           isMachOFile(fullPath),
-                           !needDumpFilePaths.contains(fullPath) {
+        if let enumerator = fileManager.enumerator(atPath: directory) {
+            while let item = enumerator.nextObject() as? String {
+                if item.hasSuffix("_CodeSignature") {
+                    let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
+                    
+                    do {
+                        let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
+                        for file in contents {
+                            let fullPath = (parentDir as NSString).appendingPathComponent(file)
+                            var isDir: ObjCBool = false
                             
-                            let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
-                            let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
-                            
-                            needDumpFilePaths.append(fullPath)
-                            dumpedFilePaths.append(targetPath)
-                            consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
+                            if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
+                               !isDir.boolValue,
+                               isMachOFile(fullPath),
+                               !needDumpFilePaths.contains(fullPath) {
+                                let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
+                                let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
+                                needDumpFilePaths.append(fullPath)
+                                dumpedFilePaths.append(targetPath)
+                                consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
+                            }
                         }
+                    } catch {
+                        consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
                     }
-                } catch {
-                    consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
                 }
             }
         }
