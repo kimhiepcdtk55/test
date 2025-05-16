@@ -1,10 +1,3 @@
-//
-//  Dump.swift
-//  appdump
-//
-//  Created by paradiseduo on 2021/7/29.
-//
-
 import Foundation
 import MachO
 
@@ -95,21 +88,36 @@ class Dump {
                         }
                     }
                     #endif
-                    needDumpFilePaths.append(sourceUrl+"/"+item+"/"+machOName)
-                    dumpedFilePaths.append(targetUrl+"/"+item+"/"+machOName)
+                    let sourcePath = sourceUrl+"/"+item+"/"+machOName
+                    let targetPath = targetUrl+"/"+item+"/"+machOName
+                    if !needDumpFilePaths.contains(sourcePath) {
+                        needDumpFilePaths.append(sourcePath)
+                        dumpedFilePaths.append(targetPath)
+                        consoleIO.writeMessage("[+] Found Mach-O via .app: \(sourcePath)")
+                    }
                 }
                 if item.hasSuffix(".framework") {
                     let frameName = item.components(separatedBy: "/").last?.components(separatedBy: ".framework").first ?? ""
                     if frameName != "" {
-                        needDumpFilePaths.append(sourceUrl+"/"+item+"/"+frameName)
-                        dumpedFilePaths.append(targetUrl+"/"+item+"/"+frameName)
+                        let sourcePath = sourceUrl+"/"+item+"/"+frameName
+                        let targetPath = targetUrl+"/"+item+"/"+frameName
+                        if !needDumpFilePaths.contains(sourcePath) {
+                            needDumpFilePaths.append(sourcePath)
+                            dumpedFilePaths.append(targetPath)
+                            consoleIO.writeMessage("[+] Found Mach-O via .framework: \(sourcePath)")
+                        }
                     }
                 }
                 if item.hasSuffix(".appex") {
                     let exName = item.components(separatedBy: "/").last?.components(separatedBy: ".appex").first ?? ""
                     if exName != "" {
-                        needDumpFilePaths.append(sourceUrl+"/"+item+"/"+exName)
-                        dumpedFilePaths.append(targetUrl+"/"+item+"/"+exName)
+                        let sourcePath = sourceUrl+"/"+item+"/"+exName
+                        let targetPath = targetUrl+"/"+item+"/"+exName
+                        if !needDumpFilePaths.contains(sourcePath) {
+                            needDumpFilePaths.append(sourcePath)
+                            dumpedFilePaths.append(targetPath)
+                            consoleIO.writeMessage("[+] Found Mach-O via .appex: \(sourcePath)")
+                        }
                     }
                 }
             }
@@ -121,7 +129,13 @@ class Dump {
         // 2. Bổ sung: Tìm Mach-O files qua thư mục _CodeSignature
         findMachOFilesViaCodeSignature(in: sourceUrl, needDumpFilePaths: &needDumpFilePaths, dumpedFilePaths: &dumpedFilePaths)
         
-        // Xử lý dump tất cả các file đã tìm thấy
+        // 3. Xử lý dump tất cả các file đã tìm thấy
+        if needDumpFilePaths.isEmpty {
+            consoleIO.writeMessage("No Mach-O files found to dump.", to: .error)
+            return
+        }
+        
+        consoleIO.writeMessage("Found \(needDumpFilePaths.count) Mach-O files to dump.")
         for (i, sourcePath) in needDumpFilePaths.enumerated() {
             let targetPath = dumpedFilePaths[i]
             let handle = dlopen(sourcePath, RTLD_LAZY | RTLD_GLOBAL)
@@ -139,7 +153,7 @@ class Dump {
                                     return
                                 }
                                 
-                                var segCmd : UnsafeMutablePointer<load_command>!
+                                var segCmd: UnsafeMutablePointer<load_command>!
                                 for _: UInt32 in 0 ..< header.pointee.ncmds {
                                     segCmd = curCmd
                                     if segCmd.pointee.cmd == LC_ENCRYPTION_INFO_64 {
@@ -178,38 +192,37 @@ class Dump {
         }
     }
     
-    // MARK: - Phương pháp tìm kiếm mới bổ sung
+    // MARK: - Phương pháp tìm kiếm qua _CodeSignature
     private func findMachOFilesViaCodeSignature(in directory: String, needDumpFilePaths: inout [String], dumpedFilePaths: inout [String]) {
         let fileManager = FileManager.default
         
-        if let enumerator = fileManager.enumerator(atPath: directory) {
-            while let item = enumerator.nextObject() as? String {
-                if item.hasSuffix("_CodeSignature") {
-                    let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
-                    
-                    do {
-                        let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
+        // Sử dụng enumerator với tùy chọn bỏ qua thư mục con không cần thiết
+        let enumerator = fileManager.enumerator(atPath: directory)
+        while let item = enumerator?.nextObject() as? String {
+            if item.hasSuffix("_CodeSignature") {
+                let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
+                
+                do {
+                    let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
+                    for file in contents {
+                        let fullPath = (parentDir as NSString).appendingPathComponent(file)
+                        var isDir: ObjCBool = false
                         
-                        for file in contents {
-                            let fullPath = (parentDir as NSString).appendingPathComponent(file)
-                            var isDir: ObjCBool = false
+                        if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
+                           !isDir.boolValue,
+                           isMachOFile(fullPath),
+                           !needDumpFilePaths.contains(fullPath) {
                             
-                            if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
-                               !isDir.boolValue,
-                               isMachOFile(fullPath),
-                               !needDumpFilePaths.contains(fullPath) {
-                                
-                                let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
-                                let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
-                                
-                                needDumpFilePaths.append(fullPath)
-                                dumpedFilePaths.append(targetPath)
-                                consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
-                            }
+                            let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
+                            let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
+                            
+                            needDumpFilePaths.append(fullPath)
+                            dumpedFilePaths.append(targetPath)
+                            consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
                         }
-                    } catch {
-                        consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
                     }
+                } catch {
+                    consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
                 }
             }
         }
