@@ -1,5 +1,5 @@
 //
-//  dump.swift
+//  Dump.swift
 //  appdump
 //
 //  Created by paradiseduo on 2021/7/29.
@@ -13,14 +13,14 @@ func mremap_encrypted(_: UnsafeMutableRawPointer, _: Int, _: UInt32, _: UInt32, 
 
 class Dump {
     let consoleIO = ConsoleIO()
+    var targetUrl = ""
+    
     func staticMode() {
         if CommandLine.argc < 3 {
             consoleIO.printUsage()
             return
         }
-        if CommandLine.arguments.contains(where: { (s) -> Bool in
-            return s=="-h" || s=="--help"
-        }) {
+        if CommandLine.arguments.contains(where: { $0 == "-h" || $0 == "--help" }) {
             consoleIO.printUsage()
             return
         }
@@ -30,7 +30,7 @@ class Dump {
         if sourceUrl.hasSuffix("/") {
             sourceUrl.removeLast()
         }
-        var targetUrl = CommandLine.arguments[2]
+        targetUrl = CommandLine.arguments[2]
         if targetUrl.hasSuffix("/") {
             targetUrl.removeLast()
         }
@@ -43,11 +43,11 @@ class Dump {
             targetUrl += "/Payload"
         }
         #endif
+        
         do {
             consoleIO.writeMessage("Copy From \(sourceUrl) to \(targetUrl)")
             var isDirectory: ObjCBool = false
             if fileManager.fileExists(atPath: targetUrl, isDirectory: &isDirectory) {
-                // remove old files to ensure the integrity of the dump
                 if isDirectory.boolValue && !targetUrl.hasSuffix(".app") {
                     consoleIO.writeMessage("\(targetUrl) is a Directory")
                 } else {
@@ -63,6 +63,8 @@ class Dump {
         
         var needDumpFilePaths = [String]()
         var dumpedFilePaths = [String]()
+        
+        // 1. Tìm Mach-O files bằng phương pháp gốc (qua extension)
         let enumeratorAtPath = fileManager.enumerator(atPath: sourceUrl)
         if let arr = enumeratorAtPath?.allObjects as? [String] {
             for item in arr {
@@ -116,10 +118,12 @@ class Dump {
             return
         }
         
+        // 2. Bổ sung: Tìm Mach-O files qua thư mục _CodeSignature
+        findMachOFilesViaCodeSignature(in: sourceUrl, needDumpFilePaths: &needDumpFilePaths, dumpedFilePaths: &dumpedFilePaths)
         
+        // Xử lý dump tất cả các file đã tìm thấy
         for (i, sourcePath) in needDumpFilePaths.enumerated() {
             let targetPath = dumpedFilePaths[i]
-            // Please see https://github.com/NyaMisty/fouldecrypt/issues/15#issuecomment-1722561492
             let handle = dlopen(sourcePath, RTLD_LAZY | RTLD_GLOBAL)
             Dump.mapFile(path: sourcePath, mutable: false) { base_size, base_descriptor, base_error, base_raw in
                 if let base = base_raw {
@@ -174,32 +178,78 @@ class Dump {
         }
     }
     
+    // MARK: - Phương pháp tìm kiếm mới bổ sung
+    private func findMachOFilesViaCodeSignature(in directory: String, needDumpFilePaths: inout [String], dumpedFilePaths: inout [String]) {
+        let fileManager = FileManager.default
+        
+        if let enumerator = fileManager.enumerator(atPath: directory) {
+            while let item = enumerator.nextObject() as? String {
+                if item.hasSuffix("_CodeSignature") {
+                    let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
+                    
+                    do {
+                        let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
+                        
+                        for file in contents {
+                            let fullPath = (parentDir as NSString).appendingPathComponent(file)
+                            var isDir: ObjCBool = false
+                            
+                            if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
+                               !isDir.boolValue,
+                               isMachOFile(fullPath),
+                               !needDumpFilePaths.contains(fullPath) {
+                                
+                                let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
+                                let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
+                                
+                                needDumpFilePaths.append(fullPath)
+                                dumpedFilePaths.append(targetPath)
+                                consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
+                            }
+                        }
+                    } catch {
+                        consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
+                    }
+                }
+            }
+        }
+    }
+    
+    private func isMachOFile(_ path: String) -> Bool {
+        guard let file = fopen(path, "r") else { return false }
+        defer { fclose(file) }
+        
+        var magic: UInt32 = 0
+        guard fread(&magic, 4, 1, file) == 1 else { return false }
+        
+        // Mach-O magic numbers (MH_MAGIC, MH_MAGIC_64, MH_CIGAM, MH_CIGAM_64)
+        return magic == 0xfeedface || magic == 0xfeedfacf || 
+               magic == 0xcefaedfe || magic == 0xcffaedfe
+    }
+    
+    // MARK: - Các hàm gốc giữ nguyên
     static func dump(descriptor: Int32, dupe: UnsafeMutableRawPointer, info: encryption_info_command_64) -> (Bool, String) {
-        // https://github.com/Qcloud1223/COMP461905/issues/2#issuecomment-987510518
-        // Align the offset based on the page size
-        // See: https://man7.org/linux/man-pages/man2/mmap.2.html
         let pageSize = Float(sysconf(_SC_PAGESIZE))
         let multiplier = ceil(Float(info.cryptoff) / pageSize)
         let alignedOffset = Int(multiplier * pageSize)
 
         let cryptsize = Int(info.cryptsize)
         let cryptoff = Int(info.cryptoff)
-
         let cryptid = Int(info.cryptid)
-        // cryptid 0 doesn't need PROT_EXEC
+        
         let prot = PROT_READ | (cryptid == 0 ? 0 : PROT_EXEC)
         var base = mmap(nil, cryptsize, prot, MAP_PRIVATE, descriptor, off_t(alignedOffset))
         if base == MAP_FAILED {
             return (false, "mmap fail with \(String(cString: strerror(errno)))")
         }
+        
         let error = mremap_encrypted(base!, cryptsize, info.cryptid, UInt32(CPU_TYPE_ARM64), UInt32(CPU_SUBTYPE_ARM64_ALL))
         if error != 0 {
             munmap(base, cryptsize)
             return (false, "encrypted fail with \(String(cString: strerror(errno)))")
         }
 
-        // alignment needs to be adjusted, memmove will have bus error if not aligned
-        if alignedOffset - cryptoff > cryptsize  {
+        if alignedOffset - cryptoff > cryptsize {
             posix_memalign(&base, cryptsize, cryptsize)
             memmove(dupe+UnsafeMutableRawPointer.Stride(info.cryptoff), base, cryptsize)
             free(base)
@@ -233,6 +283,4 @@ class Dump {
 
         handle(Int(s.st_size), f, "", base)
     }
-    
 }
-
