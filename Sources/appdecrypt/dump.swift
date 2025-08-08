@@ -1,3 +1,8 @@
+// Dump.swift
+// appdump
+//
+// Created by paradiseduo on 2021/7/29.
+
 import Foundation
 import MachO
 
@@ -8,7 +13,7 @@ class Dump {
     let consoleIO = ConsoleIO()
     var targetUrl = ""
     
-    // Hàm thực thi lệnh shell và trả về output
+    // Hàm thực thi lệnh shell
     func shell(_ command: String) -> (String, String, Int32) {
         let task = Process()
         let stdoutPipe = Pipe()
@@ -30,6 +35,7 @@ class Dump {
     }
     
     func staticMode() {
+        // Kiểm tra đối số dòng lệnh
         if CommandLine.argc < 3 {
             consoleIO.printUsage()
             return
@@ -52,41 +58,44 @@ class Dump {
         var ignoreIOSOnlyCheck = false
         ignoreIOSOnlyCheck = CommandLine.arguments.contains("--ignore-ios-check")
         
+        // Thêm /Payload cho iOS
         #if os(iOS)
         if !targetUrl.hasSuffix("/Payload") {
             targetUrl += "/Payload"
         }
         #endif
         
+        // Sao chép thư mục nguồn sang đích
         do {
-            consoleIO.writeMessage("Copy From \(sourceUrl) to \(targetUrl)")
+            consoleIO.writeMessage("Sao chép từ \(sourceUrl) sang \(targetUrl)")
             var isDirectory: ObjCBool = false
             if fileManager.fileExists(atPath: targetUrl, isDirectory: &isDirectory) {
                 if isDirectory.boolValue && !targetUrl.hasSuffix(".app") {
-                    consoleIO.writeMessage("\(targetUrl) is a Directory")
+                    consoleIO.writeMessage("\(targetUrl) là thư mục", to: .error)
                 } else {
                     try fileManager.removeItem(atPath: targetUrl)
-                    consoleIO.writeMessage("Success to remove \(targetUrl)")
+                    consoleIO.writeMessage("Xóa \(targetUrl) thành công")
                 }
             }
             try fileManager.copyItem(atPath: sourceUrl, toPath: targetUrl)
-            consoleIO.writeMessage("Success to copy file.")
+            consoleIO.writeMessage("Sao chép file thành công")
         } catch let e {
-            consoleIO.writeMessage("Failed With \(e)", to: .error)
+            consoleIO.writeMessage("Sao chép thất bại: \(e)", to: .error)
+            return
         }
         
         var needDumpFilePaths = [String]()
         var dumpedFilePaths = [String]()
         
-        // 1. Tìm Mach-O files bằng phương pháp gốc (qua extension)
+        // 1. Tìm Mach-O files qua extension
         let enumeratorAtPath = fileManager.enumerator(atPath: sourceUrl)
         if let arr = enumeratorAtPath?.allObjects as? [String] {
             for item in arr {
                 if item.hasSuffix(".app") {
                     let machOName = item.components(separatedBy: "/").last?.components(separatedBy: ".app").first ?? ""
                     if machOName == "" {
-                        consoleIO.writeMessage("Can't find machO name.", to: .error)
-                        return
+                        consoleIO.writeMessage("Không tìm thấy tên Mach-O", to: .error)
+                        continue
                     }
                     #if os(OSX)
                     let machOFile = sourceUrl+"/"+item+"/"+machOName
@@ -100,21 +109,21 @@ class Dump {
                     if let output = String(data: data, encoding: String.Encoding.utf8) {
                         if output.contains("LC_VERSION_MIN_IPHONEOS") || output.contains("platform 2") {
                             if !ignoreIOSOnlyCheck {
-                                consoleIO.writeMessage("This app can't run on Mac M1 ! However, you can decrypt it anyway by adding argument --ignore-ios-check")
+                                consoleIO.writeMessage("Ứng dụng không chạy trên Mac M1! Thêm --ignore-ios-check để tiếp tục", to: .error)
                                 do { try fileManager.removeItem(atPath: targetUrl) } catch {}
                                 exit(-10)
                             } else {
-                                consoleIO.writeMessage("Warning ! The app is will not run on M1 Mac. Decrypting it anyway.")
+                                consoleIO.writeMessage("Cảnh báo: Ứng dụng không chạy trên Mac M1. Tiếp tục giải mã")
                             }
                         }
                     }
                     #endif
                     let sourcePath = sourceUrl+"/"+item+"/"+machOName
                     let targetPath = targetUrl+"/"+item+"/"+machOName
-                    if !needDumpFilePaths.contains(sourcePath) {
+                    if !needDumpFilePaths.contains(sourcePath) && isMachOFile(sourcePath) {
                         needDumpFilePaths.append(sourcePath)
                         dumpedFilePaths.append(targetPath)
-                        consoleIO.writeMessage("[+] Found Mach-O via .app: \(sourcePath)")
+                        consoleIO.writeMessage("[+] Tìm thấy Mach-O qua .app: \(sourcePath)")
                     }
                 }
                 if item.hasSuffix(".framework") {
@@ -122,10 +131,10 @@ class Dump {
                     if frameName != "" {
                         let sourcePath = sourceUrl+"/"+item+"/"+frameName
                         let targetPath = targetUrl+"/"+item+"/"+frameName
-                        if !needDumpFilePaths.contains(sourcePath) {
+                        if !needDumpFilePaths.contains(sourcePath) && isMachOFile(sourcePath) {
                             needDumpFilePaths.append(sourcePath)
                             dumpedFilePaths.append(targetPath)
-                            consoleIO.writeMessage("[+] Found Mach-O via .framework: \(sourcePath)")
+                            consoleIO.writeMessage("[+] Tìm thấy Mach-O qua .framework: \(sourcePath)")
                         }
                     }
                 }
@@ -134,233 +143,277 @@ class Dump {
                     if exName != "" {
                         let sourcePath = sourceUrl+"/"+item+"/"+exName
                         let targetPath = targetUrl+"/"+item+"/"+exName
-                        if !needDumpFilePaths.contains(sourcePath) {
+                        if !needDumpFilePaths.contains(sourcePath) && isMachOFile(sourcePath) {
                             needDumpFilePaths.append(sourcePath)
                             dumpedFilePaths.append(targetPath)
-                            consoleIO.writeMessage("[+] Found Mach-O via .appex: \(sourcePath)")
+                            consoleIO.writeMessage("[+] Tìm thấy Mach-O qua .appex: \(sourcePath)")
                         }
                     }
                 }
             }
         } else {
-            consoleIO.writeMessage("File is empty.", to: .error)
+            consoleIO.writeMessage("Thư mục nguồn rỗng", to: .error)
             return
         }
         
-        // 2. Bổ sung: Tìm Mach-O files qua thư mục _CodeSignature
+        // 2. Tìm Mach-O files qua _CodeSignature
         findMachOFilesViaCodeSignature(in: sourceUrl, needDumpFilePaths: &needDumpFilePaths, dumpedFilePaths: &dumpedFilePaths)
         
-        // 3. Xử lý dump tất cả các file đã tìm thấy
+        // 3. Kiểm tra danh sách trước khi giải mã
         if needDumpFilePaths.isEmpty {
-            consoleIO.writeMessage("No Mach-O files found to dump.", to: .error)
+            consoleIO.writeMessage("Không tìm thấy file Mach-O để giải mã", to: .error)
             return
         }
         
-        consoleIO.writeMessage("Found \(needDumpFilePaths.count) Mach-O files to dump.")
+        consoleIO.writeMessage("Tìm thấy \(needDumpFilePaths.count) file Mach-O để giải mã")
         
-        // Giai đoạn 1: Dump bằng phương pháp gốc (Dump.dump)
+        // 4. Giải mã tất cả file Mach-O
         var successfulDumps = 0
-        var failedDumpIndices: [Int] = [] // Lưu chỉ số của các file không dump được để gọi flexdecrypt2 sau
-        
         for (i, sourcePath) in needDumpFilePaths.enumerated() {
             let targetPath = dumpedFilePaths[i]
-            consoleIO.writeMessage("Decrypting \(sourcePath) to \(targetPath) using Dump.dump")
-            let handle = dlopen(sourcePath, RTLD_LAZY | RTLD_GLOBAL)
+            consoleIO.writeMessage("Đang giải mã \(sourcePath) sang \(targetPath)")
             
-            var dumpSuccess = false
+            // Kiểm tra xem file có mã hóa không
+            if !isEncryptedMachOFile(sourcePath) {
+                consoleIO.writeMessage("File \(sourcePath) không được mã hóa, bỏ qua giải mã")
+                successfulDumps += 1
+                continue
+            }
+            
+            let handle = dlopen(sourcePath, RTLD_LAZY | RTLD_GLOBAL)
             Dump.mapFile(path: sourcePath, mutable: false) { base_size, base_descriptor, base_error, base_raw in
                 if let base = base_raw {
                     Dump.mapFile(path: targetPath, mutable: true) { dupe_size, dupe_descriptor, dupe_error, dupe_raw in
                         if let dupe = dupe_raw {
                             if base_size == dupe_size {
                                 let header = UnsafeMutableRawPointer(mutating: dupe).assumingMemoryBound(to: mach_header_64.self)
-                                assert(header.pointee.magic == MH_MAGIC_64)
-                                assert(header.pointee.cputype == CPU_TYPE_ARM64)
-                                assert(header.pointee.cpusubtype == CPU_SUBTYPE_ARM64_ALL)
-                                
-                                guard var curCmd = UnsafeMutablePointer<load_command>(bitPattern: UInt(bitPattern: header)+UInt(MemoryLayout<mach_header_64>.size)) else {
+                                guard header.pointee.magic == MH_MAGIC_64 || header.pointee.magic == MH_CIGAM_64 else {
+                                    consoleIO.writeMessage("File \(sourcePath) không phải Mach-O 64-bit hợp lệ", to: .error)
                                     munmap(base, base_size)
                                     munmap(dupe, dupe_size)
-                                    consoleIO.writeMessage("Failed to parse load commands for \(sourcePath)", to: .error)
                                     return
                                 }
                                 
-                                var segCmd: UnsafeMutablePointer<load_command>!
-                                for _: UInt32 in 0 ..< header.pointee.ncmds {
-                                    segCmd = curCmd
+                                guard var curCmd = UnsafeMutablePointer<load_command>(bitPattern: UInt(bitPattern: header)+UInt(MemoryLayout<mach_header_64>.size)) else {
+                                    consoleIO.writeMessage("Không thể truy cập lệnh tải cho \(sourcePath)", to: .error)
+                                    munmap(base, base_size)
+                                    munmap(dupe, dupe_size)
+                                    return
+                                }
+                                
+                                var foundEncryptionInfo = false
+                                for _ in 0 ..< header.pointee.ncmds {
+                                    let segCmd = curCmd
                                     if segCmd.pointee.cmd == LC_ENCRYPTION_INFO_64 {
                                         let command = UnsafeMutableRawPointer(mutating: segCmd).assumingMemoryBound(to: encryption_info_command_64.self)
                                         let result = Dump.dump(descriptor: base_descriptor, dupe: dupe, info: command.pointee)
                                         if result.0 {
                                             command.pointee.cryptid = 0
-                                            consoleIO.writeMessage("Dump \(sourcePath) Success")
+                                            consoleIO.writeMessage("Giải mã \(sourcePath) thành công bằng mremap_encrypted")
                                             successfulDumps += 1
-                                            dumpSuccess = true
                                         } else {
-                                            consoleIO.writeMessage("Dump \(sourcePath) fail, because of \(result.1)")
+                                            consoleIO.writeMessage("Giải mã \(sourcePath) thất bại: \(result.1)", to: .error)
                                         }
+                                        foundEncryptionInfo = true
                                         break
                                     }
                                     curCmd = UnsafeMutableRawPointer(curCmd).advanced(by: Int(curCmd.pointee.cmdsize)).assumingMemoryBound(to: load_command.self)
                                 }
-                                munmap(base, base_size)
-                                munmap(dupe, dupe_size)
-                                DispatchQueue.main.async {
-                                    NotificationCenter.default.post(name: NSNotification.Name("stop"), object: nil)
+                                if !foundEncryptionInfo {
+                                    consoleIO.writeMessage("Không tìm thấy LC_ENCRYPTION_INFO_64 cho \(sourcePath)", to: .error)
                                 }
-                            } else {
                                 munmap(base, base_size)
                                 munmap(dupe, dupe_size)
-                                consoleIO.writeMessage("If the files are not of the same size, then they are not duplicates of each other, which is an error.", to: .error)
+                            } else {
+                                consoleIO.writeMessage("Kích thước file nguồn và đích không khớp cho \(sourcePath)", to: .error)
+                                munmap(base, base_size)
+                                munmap(dupe, dupe_size)
                             }
                         } else {
+                            consoleIO.writeMessage("Đọc \(targetPath) thất bại: \(dupe_error)", to: .error)
                             munmap(base, base_size)
-                            consoleIO.writeMessage("Read \(targetPath) Fail with \(dupe_error)", to: .error)
                         }
                     }
                 } else {
-                    consoleIO.writeMessage("Read \(sourcePath) Fail with \(base_error)", to: .error)
+                    consoleIO.writeMessage("Đọc \(sourcePath) thất bại: \(base_error)", to: .error)
                 }
             }
             dlclose(handle)
-            
-            // Nếu dump thất bại, lưu chỉ số để gọi flexdecrypt2 sau
-            if !dumpSuccess {
-                failedDumpIndices.append(i)
-            }
         }
         
-        // Giai đoạn 2: Nếu số file dump thành công nhỏ hơn số file Mach-O, gọi flexdecrypt2
-        if successfulDumps < needDumpFilePaths.count {
-            consoleIO.writeMessage("Number of decrypted files (\(successfulDumps)) is less than number of Mach-O files (\(needDumpFilePaths.count)). Forcing flexdecrypt2 to ensure complete decryption.")
-            
-            for index in failedDumpIndices {
-                let sourcePath = needDumpFilePaths[index]
-                let targetPath = dumpedFilePaths[index]
-                consoleIO.writeMessage("Decrypting \(sourcePath) to \(targetPath) using flexdecrypt2")
-                
-                // Gọi flexdecrypt2 để giải mã file Mach-O
-                let (flexOutput, flexError, flexStatus) = shell("/usr/local/bin/flexdecrypt2 '\(targetPath)'")
-                if flexStatus == 0 {
-                    consoleIO.writeMessage("Dump \(sourcePath) Success with flexdecrypt2")
-                    successfulDumps += 1
-                } else {
-                    consoleIO.writeMessage("Dump \(sourcePath) failed with flexdecrypt2: \(flexOutput)", to: .error)
-                    consoleIO.writeMessage("Error: \(flexError)", to: .error)
-                }
-            }
-        }
-        
-        consoleIO.writeMessage("Decryption process completed: \(successfulDumps)/\(needDumpFilePaths.count) files decrypted successfully")
+        consoleIO.writeMessage("Quá trình giải mã hoàn tất: \(successfulDumps)/\(needDumpFilePaths.count) file được giải mã thành công")
     }
     
-    // MARK: - Phương pháp tìm kiếm qua _CodeSignature
+    // Tìm Mach-O files qua _CodeSignature
     private func findMachOFilesViaCodeSignature(in directory: String, needDumpFilePaths: inout [String], dumpedFilePaths: inout [String]) {
         let fileManager = FileManager.default
         
-        // Sử dụng enumerator với tùy chọn bỏ qua thư mục con không cần thiết
-        let enumerator = fileManager.enumerator(atPath: directory)
-        while let item = enumerator?.nextObject() as? String {
-            if item.hasSuffix("_CodeSignature") {
-                let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
-                
-                do {
-                    let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
-                    for file in contents {
-                        let fullPath = (parentDir as NSString).appendingPathComponent(file)
-                        var isDir: ObjCBool = false
-                        
-                        if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
-                           !isDir.boolValue,
-                           isMachOFile(fullPath),
-                           !needDumpFilePaths.contains(fullPath) {
+        if let enumerator = fileManager.enumerator(atPath: directory) {
+            while let item = enumerator.nextObject() as? String {
+                if item.hasSuffix("_CodeSignature") {
+                    let parentDir = (directory as NSString).appendingPathComponent(item).replacingOccurrences(of: "/_CodeSignature", with: "")
+                    
+                    do {
+                        let contents = try fileManager.contentsOfDirectory(atPath: parentDir)
+                        for file in contents {
+                            let fullPath = (parentDir as NSString).appendingPathComponent(file)
+                            var isDir: ObjCBool = false
                             
-                            let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
-                            let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
-                            
-                            needDumpFilePaths.append(fullPath)
-                            dumpedFilePaths.append(targetPath)
-                            consoleIO.writeMessage("[+] Found additional Mach-O via _CodeSignature: \(fullPath)")
+                            if fileManager.fileExists(atPath: fullPath, isDirectory: &isDir),
+                               !isDir.boolValue,
+                               isMachOFile(fullPath),
+                               !needDumpFilePaths.contains(fullPath) {
+                                let relativePath = fullPath.replacingOccurrences(of: directory + "/", with: "")
+                                let targetPath = (targetUrl as NSString).appendingPathComponent(relativePath)
+                                needDumpFilePaths.append(fullPath)
+                                dumpedFilePaths.append(targetPath)
+                                consoleIO.writeMessage("[+] Tìm thấy Mach-O qua _CodeSignature: \(fullPath)")
+                            }
                         }
+                    } catch {
+                        consoleIO.writeMessage("Lỗi khi xử lý \(parentDir): \(error)", to: .error)
                     }
-                } catch {
-                    consoleIO.writeMessage("Error processing \(parentDir): \(error)", to: .error)
                 }
             }
         }
     }
     
+    // Kiểm tra file Mach-O hợp lệ
     private func isMachOFile(_ path: String) -> Bool {
-        guard let file = fopen(path, "r") else { return false }
+        guard let file = fopen(path, "r") else {
+            consoleIO.writeMessage("Không thể mở file \(path)", to: .error)
+            return false
+        }
         defer { fclose(file) }
         
-        var magic: UInt32 = 0
-        guard fread(&magic, 4, 1, file) == 1 else { return false }
+        var header = mach_header_64()
+        guard fread(&header, MemoryLayout<mach_header_64>.size, 1, file) == 1 else {
+            consoleIO.writeMessage("Không thể đọc header Mach-O của \(path)", to: .error)
+            return false
+        }
         
-        // Mach-O magic numbers (MH_MAGIC, MH_MAGIC_64, MH_CIGAM, MH_CIGAM_64)
-        return magic == 0xfeedface || magic == 0xfeedfacf || 
-               magic == 0xcefaedfe || magic == 0xcffaedfe
+        let validMagic = header.magic == MH_MAGIC_64 || header.magic == MH_CIGAM_64
+        let validType = header.filetype == MH_EXECUTE || header.filetype == MH_DYLIB || header.filetype == MH_BUNDLE
+        if !validMagic || !validType {
+            consoleIO.writeMessage("File \(path) không phải Mach-O hợp lệ", to: .error)
+            return false
+        }
+        return true
     }
     
-    // MARK: - Các hàm gốc giữ nguyên
+    // Kiểm tra xem file Mach-O có mã hóa không
+    private func isEncryptedMachOFile(_ path: String) -> Bool {
+        guard let file = fopen(path, "r") else {
+            consoleIO.writeMessage("Không thể mở file \(path)", to: .error)
+            return false
+        }
+        defer { fclose(file) }
+        
+        var header = mach_header_64()
+        guard fread(&header, MemoryLayout<mach_header_64>.size, 1, file) == 1 else {
+            consoleIO.writeMessage("Không thể đọc header Mach-O của \(path)", to: .error)
+            return false
+        }
+        
+        guard header.magic == MH_MAGIC_64 || header.magic == MH_CIGAM_64 else {
+            consoleIO.writeMessage("File \(path) không phải Mach-O 64-bit", to: .error)
+            return false
+        }
+        
+        var offset = MemoryLayout<mach_header_64>.size
+        for _ in 0..<header.ncmds {
+            var cmd = load_command()
+            guard fseek(file, Int(offset), SEEK_SET) == 0,
+                  fread(&cmd, MemoryLayout<load_command>.size, 1, file) == 1 else {
+                consoleIO.writeMessage("Không thể đọc lệnh tải của \(path)", to: .error)
+                return false
+            }
+            
+            if cmd.cmd == LC_ENCRYPTION_INFO_64 {
+                var encInfo = encryption_info_command_64()
+                guard fseek(file, Int(offset), SEEK_SET) == 0,
+                      fread(&encInfo, MemoryLayout<encryption_info_command_64>.size, 1, file) == 1 else {
+                    consoleIO.writeMessage("Không thể đọc LC_ENCRYPTION_INFO_64 của \(path)", to: .error)
+                    return false
+                }
+                return encInfo.cryptid != 0
+            }
+            offset += Int(cmd.cmdsize)
+        }
+        return false
+    }
+    
+    // Giải mã Mach-O
     static func dump(descriptor: Int32, dupe: UnsafeMutableRawPointer, info: encryption_info_command_64) -> (Bool, String) {
         let pageSize = Float(sysconf(_SC_PAGESIZE))
         let multiplier = ceil(Float(info.cryptoff) / pageSize)
         let alignedOffset = Int(multiplier * pageSize)
-
+        
         let cryptsize = Int(info.cryptsize)
         let cryptoff = Int(info.cryptoff)
         let cryptid = Int(info.cryptid)
         
-        let prot = PROT_READ | (cryptid == 0 ? 0 : PROT_EXEC)
-        var base = mmap(nil, cryptsize, prot, MAP_PRIVATE, descriptor, off_t(alignedOffset))
-        if base == MAP_FAILED {
-            return (false, "mmap fail with \(String(cString: strerror(errno)))")
+        guard cryptid != 0 else {
+            return (true, "File không được mã hóa, không cần giải mã")
         }
         
-        let error = mremap_encrypted(base!, cryptsize, info.cryptid, UInt32(CPU_TYPE_ARM64), UInt32(CPU_SUBTYPE_ARM64_ALL))
-        if error != 0 {
-            munmap(base, cryptsize)
-            return (false, "encrypted fail with \(String(cString: strerror(errno)))")
+        let prot = PROT_READ | PROT_EXEC
+        let base = mmap(nil, cryptsize, prot, MAP_PRIVATE, descriptor, off_t(alignedOffset))
+        if base == MAP_FAILED {
+            let error = String(cString: strerror(errno))
+            return (false, "mmap thất bại: \(error)")
         }
-
+        
+        let errorCode = mremap_encrypted(base!, cryptsize, info.cryptid, UInt32(CPU_TYPE_ARM64), UInt32(CPU_SUBTYPE_ARM64_ALL))
+        if errorCode != 0 {
+            let error = String(cString: strerror(errno))
+            munmap(base, cryptsize)
+            return (false, "mremap_encrypted thất bại với mã lỗi \(errorCode): \(error)")
+        }
+        
         if alignedOffset - cryptoff > cryptsize {
-            posix_memalign(&base, cryptsize, cryptsize)
-            memmove(dupe+UnsafeMutableRawPointer.Stride(info.cryptoff), base, cryptsize)
-            free(base)
+            var alignedBase: UnsafeMutableRawPointer?
+            posix_memalign(&alignedBase, cryptsize, cryptsize)
+            if let alignedBase = alignedBase {
+                memmove(dupe + UnsafeMutableRawPointer.Stride(info.cryptoff), base, cryptsize)
+                free(alignedBase)
+            } else {
+                munmap(base, cryptsize)
+                return (false, "posix_memalign thất bại")
+            }
         } else {
-            memmove(dupe+UnsafeMutableRawPointer.Stride(info.cryptoff), base, cryptsize)
-            munmap(base, cryptsize)
+            memmove(dupe + UnsafeMutableRawPointer.Stride(info.cryptoff), base, cryptsize)
         }
+        munmap(base, cryptsize)
         return (true, "")
     }
     
+    // Ánh xạ file vào bộ nhớ
     static func mapFile(path: UnsafePointer<CChar>, mutable: Bool, handle: (Int, Int32, String, UnsafeMutableRawPointer?)->()) {
         let f = open(path, mutable ? O_RDWR : O_RDONLY)
         if f < 0 {
             handle(0, 0, String(cString: strerror(errno)), nil)
             return
         }
-
+        
         var s = stat()
         if fstat(f, &s) < 0 {
             close(f)
             handle(0, 0, String(cString: strerror(errno)), nil)
             return
         }
-
+        
         let base = mmap(nil, Int(s.st_size), mutable ? (PROT_READ | PROT_WRITE) : PROT_READ, mutable ? MAP_SHARED : MAP_PRIVATE, f, 0)
         if base == MAP_FAILED {
             close(f)
             handle(0, 0, String(cString: strerror(errno)), nil)
             return
         }
-
+        
         handle(Int(s.st_size), f, "", base)
     }
 }
 
-// MARK: - ConsoleIO (giả định đã có sẵn trong dự án)
 class ConsoleIO {
     enum OutputType {
         case error
@@ -378,13 +431,12 @@ class ConsoleIO {
     
     func printUsage() {
         let executableName = (CommandLine.arguments[0] as NSString).lastPathComponent
-        writeMessage("Usage: \(executableName) <source_path> <target_path> [--ignore-ios-check]")
-        writeMessage("  <source_path>: Path to the source application directory")
-        writeMessage("  <target_path>: Path to the target directory for decrypted files")
-        writeMessage("  --ignore-ios-check: Ignore iOS-only check on macOS")
+        writeMessage("Cách sử dụng: \(executableName) <đường_dẫn_nguồn> <đường_dẫn_đích> [--ignore-ios-check]")
+        writeMessage("  <đường_dẫn_nguồn>: Đường dẫn đến thư mục ứng dụng nguồn")
+        writeMessage("  <đường_dẫn_đích>: Đường dẫn đến thư mục đích cho file giải mã")
+        writeMessage("  --ignore-ios-check: Bỏ qua kiểm tra chỉ dành cho iOS trên macOS")
     }
 }
 
-// MARK: - Main
 let dump = Dump()
 dump.staticMode()
