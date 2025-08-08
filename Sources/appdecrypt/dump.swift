@@ -414,6 +414,7 @@ class Dump {
     }
 }
 
+// Định nghĩa class ConsoleIO chỉ một lần
 class ConsoleIO {
     enum OutputType {
         case error
@@ -438,5 +439,11 @@ class ConsoleIO {
     }
 }
 
-let dump = Dump()
-dump.staticMode()
+// Hàm main để gọi staticMode
+@main
+struct AppDumpMain {
+    static func main() {
+        let dump = Dump()
+        dump.staticMode()
+    }
+}
